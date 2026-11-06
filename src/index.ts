@@ -1,8 +1,11 @@
 import { Context, Schema, h } from 'koishi';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import { tmpdir } from 'node:os';
+import http from 'node:http';
+import https from 'node:https';
+import { pipeline } from 'node:stream/promises';
 
 export interface Config {
   pythonPath: string;
@@ -26,20 +29,18 @@ export const inject = {
 };
 
 export function apply(ctx: Context, config: Config) {
-  const TMP_DIR = tmpdir();
-
   ctx.command('replay <fileUrl>', '上传 wowsreplay 文件链接生成视频')
     .alias('复盘')
     .action(async ({ session }, fileUrl) => {
       if (!fileUrl) return '请提供一个文件链接！可以使用wowsreplay.mihoyo.su上传.wowsreplay文件，然后将生成的链接发送至此';
-      if (!fileUrl.endsWith('.wowsreplay')) return '请提供后缀为 .wowsreplay 的文件链接！';
-
-      const fileName = path.basename(fileUrl);
-      const tempDir = path.resolve(__dirname, '../uploads');
-      if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir);
-
-      const replayPath = path.join(tempDir, fileName);
-      const mp4Path = replayPath.replace('.wowsreplay', '.mp4');
+      let replayUrl: URL;
+      try {
+        replayUrl = new URL(fileUrl);
+      } catch {
+        return '请提供有效的 HTTP(S) 文件链接！';
+      }
+      if (!['http:', 'https:'].includes(replayUrl.protocol)) return '请提供有效的 HTTP(S) 文件链接！';
+      if (!replayUrl.pathname.endsWith('.wowsreplay')) return '请提供后缀为 .wowsreplay 的文件链接！';
 
       const pythonPath = config.pythonPath;
 
@@ -47,9 +48,14 @@ export function apply(ctx: Context, config: Config) {
         return 'Python 路径未配置，请在后台设置。';
       }
 
+      // 每个请求使用独立目录，远程文件名不参与本地路径或命令构造。
+      const tempDir = fs.mkdtempSync(path.join(tmpdir(), 'wowsreplay-'));
+      const replayPath = path.join(tempDir, 'replay.wowsreplay');
+      const mp4Path = path.join(tempDir, 'replay.mp4');
+
       try {
         // 异步下载文件
-        await downloadFile(fileUrl, replayPath);
+        await downloadFile(replayUrl, replayPath);
 
         // 执行 Python 渲染脚本
         await runPythonScript(pythonPath, replayPath);
@@ -64,9 +70,8 @@ export function apply(ctx: Context, config: Config) {
         return h.video(video_temp, 'video/mp4')
 
       } finally {
-        // 清理临时文件
-        if (fs.existsSync(replayPath)) fs.unlinkSync(replayPath);
-        if (fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
+        // 同时清理渲染器生成的附属文件。
+        fs.rmSync(tempDir, { recursive: true, force: true });
       }
     });
 }
@@ -79,11 +84,11 @@ function getRandomMessage(messages: string[]): string {
 // 异步执行 Python 渲染脚本
 function runPythonScript(pythonPath: string, replayPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const command = `${pythonPath} -m render --replay "${replayPath}"`;
-    exec(command, (error, stdout, stderr) => {
+    // 必须直接执行程序并传递参数数组，不能让 shell 解释路径中的字符。
+    execFile(pythonPath, ['-m', 'render', '--replay', replayPath], { shell: false }, (error, stdout, stderr) => {
       if (error) {
         console.error('执行出错：', stderr);
-        return reject(error.message);
+        return reject(error);
       }
       resolve();
     });
@@ -91,25 +96,16 @@ function runPythonScript(pythonPath: string, replayPath: string): Promise<void> 
 }
 
 // 异步下载文件
-async function downloadFile(url: string, dest: string) {
-  const fs = require('fs');
-  const http = require('http');
-  const https = require('https');
-  const protocol = url.startsWith('https') ? https : http;
+async function downloadFile(url: URL, dest: string): Promise<void> {
+  const protocol = url.protocol === 'https:' ? https : http;
 
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    protocol.get(url, (response: any) => {
-      if (response.statusCode !== 200) {
-        reject(`下载失败，状态码：${response.statusCode}`);
-        return;
-      }
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close(resolve);
-      });
-    }).on('error', (err: any) => {
-      fs.unlink(dest, () => reject(err.message));
-    });
+  const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+    protocol.get(url, resolve).on('error', reject);
   });
+  if (response.statusCode !== 200) {
+    response.destroy();
+    throw new Error(`下载失败，状态码：${response.statusCode}`);
+  }
+  // 等待下载流和文件流关闭后再进行渲染或清理。
+  await pipeline(response, fs.createWriteStream(dest, { flags: 'wx' }));
 }

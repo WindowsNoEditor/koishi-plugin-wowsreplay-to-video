@@ -13,13 +13,20 @@
     "type": "git",
     "url": "git+https://github.com/Akagicv/koishi-plugin-wowsreplay-to-video.git"
   },
-  "scripts": {},
+  "scripts": {
+    "test": "node --test test/replay.test.cjs",
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [
     "chatbot",
     "koishi",
     "wows"
   ],
-  "devDependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3",
+    "yml-register": "^1.2.5"
+  },
   "peerDependencies": {
     "koishi": "^4.18.0"
   }
